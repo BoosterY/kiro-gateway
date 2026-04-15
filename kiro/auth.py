@@ -524,36 +524,33 @@ class KiroAuthManager:
     def _save_credentials_to_sqlite(self) -> None:
         """
         Saves updated credentials back to SQLite database.
-        
+
         Strategy: Read-Merge-Write (Issue #131 fix)
         1. Read existing JSON from SQLite
-        2. Merge only updated fields (access_token, refresh_token, expires_at)
+        2. Merge only updated fields (access_token/accessToken, refresh_token/refreshToken, expires_at/expiresAt)
         3. Preserve all unknown fields (startUrl, provider, registrationExpiresAt, etc.)
         4. Write back merged JSON
-        
-        This ensures compatibility with kiro-cli and future schema changes.
-        Unknown fields from kiro-cli are preserved, preventing data loss.
-        
+
+        Supports both camelCase (kiro-cli native) and snake_case field naming.
         Respects SQLITE_READONLY flag - when enabled, skips write-back entirely.
         """
         if not self._sqlite_db:
             return
-        
+
         # Check read-only mode
         if SQLITE_READONLY:
             logger.debug("SQLite write-back disabled (SQLITE_READONLY=true)")
             return
-        
+
         try:
             path = Path(self._sqlite_db).expanduser()
             if not path.exists():
                 logger.warning(f"SQLite database not found for writing: {self._sqlite_db}")
                 return
-            
-            # Use timeout to avoid blocking if database is locked
+
             conn = sqlite3.connect(str(path), timeout=5.0)
             cursor = conn.cursor()
-            
+
             # Try to save to the known key first (if we have it)
             if self._sqlite_token_key:
                 if self._try_save_to_key(cursor, self._sqlite_token_key):
@@ -563,7 +560,7 @@ class KiroAuthManager:
                     return
                 else:
                     logger.warning(f"Failed to save to primary key: {self._sqlite_token_key}, trying fallback")
-            
+
             # Fallback: try all keys (for edge cases where source key is unknown or deleted)
             for key in SQLITE_TOKEN_KEYS:
                 if self._try_save_to_key(cursor, key):
@@ -571,11 +568,10 @@ class KiroAuthManager:
                     conn.close()
                     logger.debug(f"Credentials saved to SQLite key: {key} (fallback, merged)")
                     return
-            
-            # If we get here, no keys were updated
+
             conn.close()
-            logger.warning(f"Failed to save credentials to SQLite: no matching keys found")
-            
+            logger.warning("Failed to save credentials to SQLite: no matching keys found")
+
         except sqlite3.Error as e:
             logger.error(f"SQLite error saving credentials: {e}")
         except Exception as e:
@@ -607,10 +603,16 @@ class KiroAuthManager:
                 logger.warning(f"Failed to parse JSON for key {key}, skipping: {e}")
                 return False
             
-            # Merge: update ONLY our fields, preserve EVERYTHING else
-            existing_data["access_token"] = self._access_token
-            existing_data["refresh_token"] = self._refresh_token
-            existing_data["expires_at"] = self._expires_at.isoformat() if self._expires_at else None
+            # Merge: update ONLY token fields, preserve EVERYTHING else
+            # Support both camelCase (kiro-cli native) and snake_case field names
+            if "accessToken" in existing_data:
+                existing_data["accessToken"] = self._access_token
+                existing_data["refreshToken"] = self._refresh_token
+                existing_data["expiresAt"] = self._expires_at.isoformat() if self._expires_at else None
+            else:
+                existing_data["access_token"] = self._access_token
+                existing_data["refresh_token"] = self._refresh_token
+                existing_data["expires_at"] = self._expires_at.isoformat() if self._expires_at else None
             existing_data["region"] = self._sso_region or self._region
             
             # Update scopes if we have them
