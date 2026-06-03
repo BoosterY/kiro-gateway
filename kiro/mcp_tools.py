@@ -135,6 +135,9 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
+
+    if auth_manager.profile_arn:
+        mcp_request["profileArn"] = auth_manager.profile_arn
     
     # Log MCP request
     try:
