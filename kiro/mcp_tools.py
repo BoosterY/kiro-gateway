@@ -29,7 +29,6 @@ This module provides:
 """
 
 import json
-import re
 import time
 import uuid
 import random
@@ -158,14 +157,7 @@ async def call_kiro_mcp_api(
             "Content-Type": "application/json"
         }
         
-        # MCP web_search (tools/call) must target the legacy q.{region}.amazonaws.com
-        # endpoint. The migrated runtime.{region}.kiro.dev host returns 403
-        # "User is not authorized" for InvokeMCP/tools-call (verified via capture of
-        # kiro-cli 1.29.6 TUI, which succeeds against q.amazonaws.com). The REST /mcp
-        # path itself works fine on the legacy host; only the host differs.
-        _m = re.search(r"runtime\.([a-z0-9-]+)\.kiro\.dev", auth_manager.q_host)
-        _mcp_base = f"https://q.{_m.group(1)}.amazonaws.com" if _m else auth_manager.q_host
-        mcp_url = f"{_mcp_base}/mcp"
+        mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
         
         async with httpx.AsyncClient(timeout=60.0) as client:
