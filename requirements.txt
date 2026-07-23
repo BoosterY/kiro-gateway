@@ -5,6 +5,7 @@ httpx
 loguru
 python-dotenv
 tiktoken
+mcp>=1.28.0  # native MCP server for client-driven web_search (kiro/mcp_server.py)
 
 # Testing dependencies
 pytest

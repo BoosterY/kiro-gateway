@@ -88,6 +88,7 @@ from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
+from kiro import mcp_server
 
 
 # --- Loguru Configuration ---
@@ -509,7 +510,19 @@ async def lifespan(app: FastAPI):
     
     logger.info("Account system initialized successfully")
     
-    yield
+    # ==============================================================================
+    # Native MCP server (client-driven web_search over StreamableHTTP)
+    #
+    # Share the AccountManager with the mounted MCP sub-app, then run its session
+    # manager for the lifetime of the gateway. The session manager MUST be running
+    # for the /mcp endpoint to accept requests; it is created lazily by
+    # streamable_http_app() which already ran at mount time.
+    # ==============================================================================
+    mcp_server.set_account_manager(app.state.account_manager)
+    async with mcp_server.mcp.session_manager.run():
+        logger.info("MCP server session manager started")
+        yield
+        logger.info("MCP server session manager stopping")
     
     # Graceful shutdown
     logger.info("Shutting down application...")
@@ -570,6 +583,14 @@ app.include_router(openai_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
+
+
+# --- Native MCP endpoint (client-driven web_search) ---
+# Mounts the FastMCP StreamableHTTP sub-app. Full endpoint URL is:
+#   http://<host>:<port>/mcp-tools/mcp
+# Calling streamable_http_app() here also lazily creates the session manager
+# that the lifespan starts via mcp_server.mcp.session_manager.run().
+app.mount("/mcp-tools", mcp_server.mcp.streamable_http_app())
 
 
 # --- Uvicorn log config ---
