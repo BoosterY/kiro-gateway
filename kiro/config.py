@@ -426,12 +426,16 @@ def _warn_timeout_configuration():
 # WHY "FAKE"? This is NOT native extended thinking API support. Instead, we inject
 # <thinking_mode>enabled</thinking_mode> tags into the prompt, and the model responds
 # with <thinking>...</thinking> blocks that we parse and convert to reasoning_content.
-# It works great, but it's a hack - hence "fake" reasoning.
+# It works, but it's a hack - hence "fake" reasoning.
 #
-# Default: true (enabled) - provides premium experience out of the box
+# Default: FALSE (disabled). Kiro streams NATIVE reasoning (reasoningContentEvent
+# with a real extended-thinking signature) for Claude models, which the gateway
+# now parses and forwards directly. Fake reasoning is redundant and pollutes the
+# prompt for those models. Set FAKE_REASONING=true only as a fallback for models
+# that do not emit native reasoning frames.
 _FAKE_REASONING_RAW: str = os.getenv("FAKE_REASONING", "").lower()
-# Default is True - if env var is not set or empty, enable fake reasoning
-FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW not in ("false", "0", "no", "disabled", "off")
+# Default is False - only enable when explicitly turned on
+FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW in ("true", "1", "yes", "enabled", "on")
 
 # Maximum thinking length in tokens (default budget when client doesn't specify).
 # This value is injected into the request as <max_thinking_length>{value}</max_thinking_length>

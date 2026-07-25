@@ -68,9 +68,10 @@ class KiroEvent:
     This format is API-agnostic and can be converted to both OpenAI and Anthropic formats.
     
     Attributes:
-        type: Event type (content, thinking, tool_use, usage, context_usage, error)
+        type: Event type (content, thinking, signature, tool_use, usage, context_usage, error)
         content: Text content (for content events)
         thinking_content: Thinking/reasoning content (for thinking events)
+        signature: Extended-thinking signature (for signature events)
         tool_use: Tool use data (for tool_use events)
         usage: Usage/metering data (for usage events)
         context_usage_percentage: Context usage percentage (for context_usage events)
@@ -80,6 +81,7 @@ class KiroEvent:
     type: str
     content: Optional[str] = None
     thinking_content: Optional[str] = None
+    signature: Optional[str] = None
     tool_use: Optional[Dict[str, Any]] = None
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
@@ -95,12 +97,14 @@ class StreamResult:
     Attributes:
         content: Full text content
         thinking_content: Full thinking/reasoning content
+        signature: Extended-thinking signature for the reasoning block (if any)
         tool_calls: List of tool calls
         usage: Usage information
         context_usage_percentage: Context usage percentage from Kiro API
     """
     content: str = ""
     thinking_content: str = ""
+    signature: Optional[str] = None
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
@@ -275,6 +279,14 @@ async def _process_chunk(
                 # No thinking parser - pass through as-is
                 yield KiroEvent(type="content", content=content)
         
+        elif event["type"] == "reasoning":
+            # Native reasoning delta (reasoningContentEvent) - real thinking from Kiro
+            yield KiroEvent(type="thinking", thinking_content=event["data"])
+        
+        elif event["type"] == "signature":
+            # Extended-thinking signature that closes the native reasoning block
+            yield KiroEvent(type="thinking", signature=event["data"])
+        
         elif event["type"] == "usage":
             yield KiroEvent(type="usage", usage=event["data"])
         
@@ -312,9 +324,12 @@ async def collect_stream_to_result(
         if event.type == "content" and event.content:
             result.content += event.content
             full_content_for_bracket_tools += event.content
-        elif event.type == "thinking" and event.thinking_content:
-            result.thinking_content += event.thinking_content
-            full_content_for_bracket_tools += event.thinking_content
+        elif event.type == "thinking":
+            if event.thinking_content:
+                result.thinking_content += event.thinking_content
+                full_content_for_bracket_tools += event.thinking_content
+            if event.signature:
+                result.signature = event.signature
         elif event.type == "tool_use" and event.tool_use:
             result.tool_calls.append(event.tool_use)
         elif event.type == "usage" and event.usage:

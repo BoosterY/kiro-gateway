@@ -238,8 +238,16 @@ class AwsEventStreamParser:
     """
     
     # Patterns for finding JSON events
+    #
+    # Native reasoning frames (reasoningContentEvent) carry {"text": "..."} and
+    # the extended-thinking signature arrives as a separate {"signature": "..."}
+    # frame. These prefixes do not collide with answer frames, which use
+    # {"content": "..."} (assistantResponseEvent). Verified against a captured
+    # raw stream: reasoning deltas -> signature -> answer deltas.
     EVENT_PATTERNS = [
         ('{"content":', 'content'),
+        ('{"text":', 'reasoning'),
+        ('{"signature":', 'signature'),
         ('{"name":', 'tool_start'),
         ('{"input":', 'tool_input'),
         ('{"stop":', 'tool_stop'),
@@ -318,6 +326,10 @@ class AwsEventStreamParser:
         """
         if event_type == 'content':
             return self._process_content_event(data)
+        elif event_type == 'reasoning':
+            return self._process_reasoning_event(data)
+        elif event_type == 'signature':
+            return self._process_signature_event(data)
         elif event_type == 'tool_start':
             return self._process_tool_start_event(data)
         elif event_type == 'tool_input':
@@ -346,6 +358,20 @@ class AwsEventStreamParser:
         self.last_content = content
         
         return {"type": "content", "data": content}
+    
+    def _process_reasoning_event(self, data: dict) -> Optional[Dict[str, Any]]:
+        """Processes native reasoning delta (reasoningContentEvent)."""
+        text = data.get('text', '')
+        if not text:
+            return None
+        return {"type": "reasoning", "data": text}
+    
+    def _process_signature_event(self, data: dict) -> Optional[Dict[str, Any]]:
+        """Processes the extended-thinking signature that closes a reasoning block."""
+        signature = data.get('signature', '')
+        if not signature:
+            return None
+        return {"type": "signature", "data": signature}
     
     def _process_tool_start_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes tool call start."""

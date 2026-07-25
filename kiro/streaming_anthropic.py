@@ -85,19 +85,6 @@ def format_sse_event(event_type: str, data: Dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def generate_thinking_signature() -> str:
-    """
-    Generate a placeholder signature for thinking content blocks.
-    
-    In real Anthropic API, this is a cryptographic signature for verification.
-    Since we're using fake reasoning via tag injection, we generate a placeholder.
-    
-    Returns:
-        Placeholder signature string
-    """
-    return f"sig_{uuid.uuid4().hex[:32]}"
-
-
 def _extract_cache_usage_fields(usage: Optional[Dict[str, Any]]) -> Dict[str, int]:
     """
     Extract cache token fields from upstream usage (if present).
@@ -191,9 +178,6 @@ async def stream_kiro_to_anthropic(
     tool_blocks: List[Dict[str, Any]] = []
     tool_input_buffers: Dict[int, str] = {}  # index -> accumulated JSON
     
-    # Generate signature for thinking block (used if thinking is present)
-    thinking_signature = generate_thinking_signature()
-    
     # Track context usage for token calculation
     context_usage_percentage: Optional[float] = None
     upstream_cache_usage: Dict[str, int] = {}
@@ -259,26 +243,29 @@ async def stream_kiro_to_anthropic(
                     })
             
             elif event.type == "thinking":
+                # Native reasoning arrives as separate events: reasoning-text
+                # deltas (thinking_content) followed by exactly one closing
+                # extended-thinking signature (signature).
                 thinking_content = event.thinking_content or ""
-                full_thinking_content += thinking_content
+                if thinking_content:
+                    full_thinking_content += thinking_content
                 
-                # Handle thinking content based on mode
+                # Handle thinking based on mode
                 if FAKE_REASONING_HANDLING == "as_reasoning_content":
-                    # Use native Anthropic thinking content blocks
-                    if not thinking_block_started:
-                        thinking_block_index = current_block_index
-                        yield format_sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": thinking_block_index,
-                            "content_block": {
-                                "type": "thinking",
-                                "thinking": "",
-                                "signature": thinking_signature
-                            }
-                        })
-                        thinking_block_started = True
-                    
+                    # Native Anthropic thinking content block
                     if thinking_content:
+                        if not thinking_block_started:
+                            thinking_block_index = current_block_index
+                            yield format_sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": thinking_block_index,
+                                "content_block": {
+                                    "type": "thinking",
+                                    "thinking": ""
+                                }
+                            })
+                            thinking_block_started = True
+                        
                         yield format_sse_event("content_block_delta", {
                             "type": "content_block_delta",
                             "index": thinking_block_index,
@@ -287,32 +274,45 @@ async def stream_kiro_to_anthropic(
                                 "thinking": thinking_content
                             }
                         })
-                
-                elif FAKE_REASONING_HANDLING == "include_as_text":
-                    # Include thinking as regular text content
-                    # Close thinking block if it was open (shouldn't happen in this mode)
-                    if thinking_block_started and thinking_block_index is not None:
-                        yield format_sse_event("content_block_stop", {
-                            "type": "content_block_stop",
-                            "index": thinking_block_index
-                        })
-                        thinking_block_started = False
-                        current_block_index += 1
                     
-                    # Start text block if not started
-                    if not text_block_started:
-                        text_block_index = current_block_index
-                        yield format_sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": text_block_index,
-                            "content_block": {
-                                "type": "text",
-                                "text": ""
+                    # Emit the REAL signature via signature_delta. Spec-correct
+                    # position: after thinking_deltas, before content_block_stop.
+                    # Never fabricate one - if absent (e.g. truncation) send nothing.
+                    if event.signature and thinking_block_started and thinking_block_index is not None:
+                        yield format_sse_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": thinking_block_index,
+                            "delta": {
+                                "type": "signature_delta",
+                                "signature": event.signature
                             }
                         })
-                        text_block_started = True
-                    
+                
+                elif FAKE_REASONING_HANDLING == "include_as_text":
+                    # Include thinking as regular text content (signature ignored)
                     if thinking_content:
+                        # Close thinking block if it was open (shouldn't happen in this mode)
+                        if thinking_block_started and thinking_block_index is not None:
+                            yield format_sse_event("content_block_stop", {
+                                "type": "content_block_stop",
+                                "index": thinking_block_index
+                            })
+                            thinking_block_started = False
+                            current_block_index += 1
+                        
+                        # Start text block if not started
+                        if not text_block_started:
+                            text_block_index = current_block_index
+                            yield format_sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": text_block_index,
+                                "content_block": {
+                                    "type": "text",
+                                    "text": ""
+                                }
+                            })
+                            text_block_started = True
+                        
                         yield format_sse_event("content_block_delta", {
                             "type": "content_block_delta",
                             "index": text_block_index,
@@ -764,13 +764,17 @@ async def collect_anthropic_response(
     # Build content blocks
     content_blocks = []
     
-    # Add thinking block FIRST if there's thinking content and mode is as_reasoning_content
+    # Add thinking block FIRST if there's thinking content and mode is as_reasoning_content.
+    # Emit the REAL signature from the stream; never fabricate one. If absent
+    # (e.g. truncated stream) the block carries no signature.
     if result.thinking_content and FAKE_REASONING_HANDLING == "as_reasoning_content":
-        content_blocks.append({
+        thinking_block: Dict[str, Any] = {
             "type": "thinking",
             "thinking": result.thinking_content,
-            "signature": generate_thinking_signature()
-        })
+        }
+        if result.signature:
+            thinking_block["signature"] = result.signature
+        content_blocks.append(thinking_block)
     
     # Add text block if there's content
     # For include_as_text mode, prepend thinking content to regular content
