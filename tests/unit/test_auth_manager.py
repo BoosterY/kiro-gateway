@@ -768,6 +768,118 @@ class TestKiroAuthManagerSqliteCredentials:
         assert manager._region == "us-east-1"
 
 
+class TestKiroAuthManagerSqliteReloadOnChange:
+    """Tests for mtime-gated SQLite reload (kiro-cli credential rotation)."""
+
+    def _rewrite_token(self, db_path, access_token):
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        token_data = {
+            "access_token": access_token,
+            "refresh_token": "sqlite_refresh_token",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "region": "eu-west-1",
+        }
+        conn.execute(
+            "UPDATE auth_kv SET value = ? WHERE key = ?",
+            (json.dumps(token_data), "codewhisperer:odic:token"),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_records_mtime_on_initial_load(self, temp_sqlite_db):
+        """mtime is captured on the initial SQLite load."""
+        manager = KiroAuthManager(sqlite_db=temp_sqlite_db)
+        assert manager._sqlite_mtime is not None
+
+    def test_reload_when_file_changed(self, temp_sqlite_db):
+        """
+        A changed SQLite file (kiro-cli rotated credentials) is reloaded even
+        though the in-memory token is not expiring soon (expiry is year 2099).
+        """
+        import os, time
+        manager = KiroAuthManager(sqlite_db=temp_sqlite_db)
+        assert manager._access_token == "sqlite_access_token"
+
+        self._rewrite_token(temp_sqlite_db, "rotated_access_token")
+        # Ensure mtime advances even on coarse-grained filesystems.
+        future = time.time() + 10
+        os.utime(temp_sqlite_db, (future, future))
+
+        reloaded = manager._reload_sqlite_if_changed()
+        assert reloaded is True
+        assert manager._access_token == "rotated_access_token"
+
+    def test_no_reload_when_file_unchanged(self, temp_sqlite_db):
+        """An unchanged file is not re-read (cheap stat, no parse)."""
+        manager = KiroAuthManager(sqlite_db=temp_sqlite_db)
+        with patch.object(manager, "_load_credentials_from_sqlite") as mock_load:
+            result = manager._reload_sqlite_if_changed()
+        assert result is False
+        mock_load.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_access_token_adopts_rotated_token(self, temp_sqlite_db):
+        """
+        get_access_token returns the rotated token after kiro-cli changes the
+        file, without any network refresh (token still far from expiry).
+        """
+        import os, time
+        manager = KiroAuthManager(sqlite_db=temp_sqlite_db)
+        assert await manager.get_access_token() == "sqlite_access_token"
+
+        self._rewrite_token(temp_sqlite_db, "rotated_access_token")
+        future = time.time() + 10
+        os.utime(temp_sqlite_db, (future, future))
+
+        assert await manager.get_access_token() == "rotated_access_token"
+
+    def test_reload_when_only_wal_sidecar_changed(self, temp_sqlite_db):
+        """
+        WAL-mode forward-compat: if kiro-cli writes to the -wal sidecar and the
+        main file's mtime does NOT advance, the change is still detected via the
+        sidecar's mtime.
+        """
+        import os, time
+        manager = KiroAuthManager(sqlite_db=temp_sqlite_db)
+
+        # Rotate the token but keep the main file's mtime pinned to its old
+        # value, simulating a WAL write where only the sidecar advances.
+        main_mtime = os.stat(temp_sqlite_db).st_mtime
+        self._rewrite_token(temp_sqlite_db, "wal_rotated_token")
+        os.utime(temp_sqlite_db, (main_mtime, main_mtime))
+
+        wal = temp_sqlite_db + "-wal"
+        with open(wal, "w") as fh:
+            fh.write("x")
+        future = time.time() + 10
+        os.utime(wal, (future, future))
+        try:
+            reloaded = manager._reload_sqlite_if_changed()
+            assert reloaded is True
+            assert manager._access_token == "wal_rotated_token"
+        finally:
+            # sqlite3.connect during reload may checkpoint/consume a stray -wal
+            if os.path.exists(wal):
+                os.remove(wal)
+
+    @pytest.mark.asyncio
+    async def test_reload_credentials_from_sqlite_reports_change(self, temp_sqlite_db):
+        """
+        reload_credentials_from_sqlite (used by the 400 recovery path) returns
+        True when the token changed and False when it did not.
+        """
+        manager = KiroAuthManager(sqlite_db=temp_sqlite_db)
+
+        # Unchanged file -> same token -> False
+        assert await manager.reload_credentials_from_sqlite() is False
+
+        # Rotated file -> different token -> True
+        self._rewrite_token(temp_sqlite_db, "rotated_access_token")
+        assert await manager.reload_credentials_from_sqlite() is True
+        assert manager._access_token == "rotated_access_token"
+
+
 # =============================================================================
 # Tests for _refresh_token_request() routing
 # =============================================================================

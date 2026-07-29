@@ -25,6 +25,7 @@ def mock_auth_manager_for_http():
     manager = Mock(spec=KiroAuthManager)
     manager.get_access_token = AsyncMock(return_value="test_access_token")
     manager.force_refresh = AsyncMock(return_value="new_access_token")
+    manager.reload_credentials_from_sqlite = AsyncMock(return_value=True)
     manager.fingerprint = "test_fingerprint_12345678"
     manager._fingerprint = "test_fingerprint_12345678"
     return manager
@@ -418,6 +419,8 @@ class TestKiroHttpClientRequestWithRetry:
         
         mock_response = AsyncMock()
         mock_response.status_code = 400
+        # Generic 400 (not a stale-token signature) - must be returned as-is
+        mock_response.aread = AsyncMock(return_value=b'{"message": "Improperly formed request."}')
         
         mock_client = AsyncMock()
         mock_client.is_closed = False
@@ -1280,4 +1283,96 @@ class TestKiroHttpClientRequestParameters:
         assert "content" in captured_kwargs, f"content not found: {captured_kwargs}"
         assert captured_kwargs["params"]["filter"] == "active"
         assert json.loads(captured_kwargs["content"])["data"] == "value"
+
+
+class TestKiroHttpClientStaleToken400:
+    """Tests for stale-token 400 recovery (reload SQLite creds and retry once)."""
+
+    @pytest.mark.asyncio
+    async def test_stale_token_400_reloads_and_retries(self, mock_auth_manager_for_http):
+        """
+        What it does: A 400 with reason INVALID_MODEL_ID triggers a one-shot
+        SQLite credential reload and a retry that then succeeds.
+        Purpose: Recover from kiro-cli rotating credentials out from under a
+        long-running gateway without a manual restart.
+        """
+        stale_400 = AsyncMock()
+        stale_400.status_code = 400
+        stale_400.aread = AsyncMock(return_value=b'{"message": "Invalid model ID.", "reason": "INVALID_MODEL_ID"}')
+        stale_400.aclose = AsyncMock()
+
+        ok_200 = AsyncMock()
+        ok_200.status_code = 200
+
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(side_effect=[stale_400, ok_200])
+
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                response = await http_client.request_with_retry(
+                    "POST", "https://api.example.com/test", {"data": "value"}
+                )
+
         assert response.status_code == 200
+        mock_auth_manager_for_http.reload_credentials_from_sqlite.assert_awaited_once()
+        assert mock_client.request.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_stale_token_400_unchanged_token_returns_400(self, mock_auth_manager_for_http):
+        """
+        What it does: If the SQLite reload yields the same token (nothing rotated),
+        the 400 is returned as a genuine error without looping.
+        Purpose: Avoid pointless retries when the 400 is real.
+        """
+        mock_auth_manager_for_http.reload_credentials_from_sqlite = AsyncMock(return_value=False)
+
+        stale_400 = AsyncMock()
+        stale_400.status_code = 400
+        stale_400.aread = AsyncMock(return_value=b'{"message": "Invalid model ID.", "reason": "INVALID_MODEL_ID"}')
+        stale_400.aclose = AsyncMock()
+
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(return_value=stale_400)
+
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                response = await http_client.request_with_retry(
+                    "POST", "https://api.example.com/test", {"data": "value"}
+                )
+
+        assert response.status_code == 400
+        mock_auth_manager_for_http.reload_credentials_from_sqlite.assert_awaited_once()
+        mock_client.request.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_non_stale_400_not_retried(self, mock_auth_manager_for_http):
+        """
+        What it does: A 400 without the stale-token reason is returned as-is,
+        with no SQLite reload attempt.
+        Purpose: Only the INVALID_MODEL_ID signature triggers recovery.
+        """
+        generic_400 = AsyncMock()
+        generic_400.status_code = 400
+        generic_400.aread = AsyncMock(return_value=b'{"message": "Improperly formed request."}')
+
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(return_value=generic_400)
+
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                response = await http_client.request_with_retry(
+                    "POST", "https://api.example.com/test", {"data": "value"}
+                )
+
+        assert response.status_code == 400
+        mock_auth_manager_for_http.reload_credentials_from_sqlite.assert_not_awaited()
+        mock_client.request.assert_called_once()

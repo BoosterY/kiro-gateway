@@ -165,6 +165,11 @@ class KiroAuthManager:
         # Track which SQLite key we loaded credentials from (for saving back to correct location)
         self._sqlite_token_key: Optional[str] = None
         
+        # Track the SQLite file mtime we last loaded from, so we can detect when
+        # kiro-cli rotates credentials out from under a long-running gateway and
+        # reload only when the file actually changed (cheap stat vs full re-read).
+        self._sqlite_mtime: Optional[float] = None
+        
         self._access_token: Optional[str] = None
         self._expires_at: Optional[datetime] = None
         self._lock = asyncio.Lock()
@@ -372,6 +377,12 @@ class KiroAuthManager:
                 logger.debug(f"Failed to auto-detect API region from profile ARN: {e}")
 
             conn.close()
+            
+            # Remember the file mtime we just loaded, so _reload_sqlite_if_changed()
+            # can skip re-reading when nothing has changed. Uses the same
+            # main+WAL effective-mtime logic as the change check.
+            self._sqlite_mtime = self._current_sqlite_mtime()
+            
             logger.info(f"Credentials loaded from SQLite database: {db_path}")
             
         except sqlite3.Error as e:
@@ -869,6 +880,66 @@ class KiroAuthManager:
         else:
             self._save_credentials_to_file()
     
+    def _current_sqlite_mtime(self) -> Optional[float]:
+        """
+        Returns the effective mtime of the SQLite credential store.
+
+        This is the max of the main database file and its -wal sidecar (if any).
+        In the default 'delete' journal mode kiro-cli writes straight to the
+        main file, so its mtime advances on every credential rotation. If
+        kiro-cli ever switches to WAL mode, writes land in the -wal sidecar and
+        the main file's mtime can stall — including the sidecar here keeps
+        change-detection correct across both modes.
+
+        Returns:
+            The larger of the two mtimes, or None if the main file is missing.
+        """
+        if not self._sqlite_db:
+            return None
+        try:
+            path = Path(self._sqlite_db).expanduser()
+            mtime = path.stat().st_mtime
+        except OSError:
+            return None
+        try:
+            wal_mtime = path.with_name(path.name + "-wal").stat().st_mtime
+            if wal_mtime > mtime:
+                mtime = wal_mtime
+        except OSError:
+            pass  # No WAL sidecar (delete mode) — main file mtime is authoritative
+        return mtime
+
+    def _reload_sqlite_if_changed(self) -> bool:
+        """
+        Reloads credentials from SQLite only if the file changed since last load.
+
+        kiro-cli shares the same SQLite database and may rotate credentials
+        (re-login, background refresh) while this long-running gateway keeps a
+        stale token cached in memory. Detecting a stale token only via local
+        expiry time misses this case, because the rotated-out token can still be
+        "not expiring soon" by the clock yet already rejected upstream (400).
+
+        This performs a cheap stat() and only re-reads/parses the DB when the
+        mtime advanced, so it is safe to call on the hot path.
+
+        Returns:
+            True if credentials were reloaded, False otherwise.
+        """
+        if not self._sqlite_db:
+            return False
+        current_mtime = self._current_sqlite_mtime()
+        if current_mtime is None:
+            return False
+
+        if self._sqlite_mtime is not None and current_mtime <= self._sqlite_mtime:
+            return False
+
+        logger.debug(
+            "SQLite mtime changed (kiro-cli may have rotated credentials), reloading"
+        )
+        self._load_credentials_from_sqlite(self._sqlite_db)
+        return True
+
     async def get_access_token(self) -> str:
         """
         Returns a valid access_token, refreshing it if necessary.
@@ -888,6 +959,12 @@ class KiroAuthManager:
             ValueError: If unable to obtain access token
         """
         async with self._lock:
+            # SQLite mode: if kiro-cli rotated credentials (file changed), adopt
+            # them even when our cached token isn't expiring soon. This closes the
+            # window where a token is "locally valid" but already invalidated
+            # upstream, which otherwise surfaces as a 400 until a manual restart.
+            self._reload_sqlite_if_changed()
+            
             # Token is valid and not expiring soon - just return it
             if self._access_token and not self.is_token_expiring_soon():
                 return self._access_token
@@ -947,6 +1024,28 @@ class KiroAuthManager:
         async with self._lock:
             await self._refresh_token_request()
             return self._access_token
+
+    async def reload_credentials_from_sqlite(self) -> bool:
+        """
+        Force-reloads credentials from SQLite, ignoring the mtime cache.
+
+        Used as a recovery step when the upstream API rejects the current
+        access token (e.g. a 400 caused by kiro-cli rotating credentials out
+        from under a long-running gateway). Unlike get_access_token's
+        mtime-gated reload, this always re-reads the DB because the in-memory
+        token is already proven bad.
+
+        Returns:
+            True if a different (non-empty) access token was loaded, so the
+            caller can decide whether retrying is worthwhile. Returns False if
+            not in SQLite mode or the token is unchanged.
+        """
+        if not self._sqlite_db:
+            return False
+        async with self._lock:
+            old_token = self._access_token
+            self._load_credentials_from_sqlite(self._sqlite_db)
+            return self._access_token is not None and self._access_token != old_token
     
     @property
     def profile_arn(self) -> Optional[str]:

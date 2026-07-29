@@ -94,6 +94,9 @@ class KiroHttpClient:
         self._shared_client = shared_client
         self._owns_client = shared_client is None
         self.client: Optional[httpx.AsyncClient] = shared_client
+        # Guards the one-shot SQLite reload on a stale-token 400 so a genuine
+        # 400 (e.g. truly invalid model) can't cause a retry loop.
+        self._stale_token_reload_done = False
     
     async def _get_client(self, stream: bool = False) -> httpx.AsyncClient:
         """
@@ -167,6 +170,30 @@ class KiroHttpClient:
                 # Propagating here could mask the original exception
                 logger.warning(f"Error closing HTTP client: {e}")
     
+    async def _is_stale_token_400(self, response: httpx.Response) -> bool:
+        """
+        Decides whether a 400 response looks like a stale-token rejection.
+
+        A token rotated out by kiro-cli surfaces upstream as reason
+        INVALID_MODEL_ID ("Invalid model ID or insufficient subscription level").
+        We reload credentials and retry only for this signature so that a
+        genuinely invalid request isn't retried pointlessly.
+
+        Reads the response body (works for both streamed and buffered responses)
+        without raising; on any parse failure it conservatively returns False.
+        """
+        try:
+            body = await response.aread()
+        except Exception:
+            return False
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        return data.get("reason") == "INVALID_MODEL_ID"
+
     async def request_with_retry(
         self,
         method: str,
@@ -243,6 +270,28 @@ class KiroHttpClient:
                     logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{MAX_RETRIES})")
                     await self.auth_manager.force_refresh()
                     continue
+                
+                # 400 - may be a stale token that kiro-cli rotated out from under
+                # a long-running gateway. Such a request surfaces upstream as
+                # "Invalid model ID or insufficient subscription level" (reason
+                # INVALID_MODEL_ID). Reload credentials from SQLite once and retry;
+                # if the token didn't change, treat it as a genuine 400 and return.
+                if response.status_code == 400 and not self._stale_token_reload_done:
+                    if await self._is_stale_token_400(response):
+                        self._stale_token_reload_done = True
+                        reloaded = await self.auth_manager.reload_credentials_from_sqlite()
+                        if reloaded:
+                            logger.warning(
+                                f"Received 400 with stale-token signature, reloaded "
+                                f"credentials from SQLite, retrying (attempt {attempt + 1}/{max_retries})"
+                            )
+                            await response.aclose()
+                            continue
+                        logger.info(
+                            "Received 400 with stale-token signature but SQLite token "
+                            "unchanged; treating as genuine error"
+                        )
+                    return response
                 
                 # 429 - rate limit, wait and retry
                 if response.status_code == 429:
