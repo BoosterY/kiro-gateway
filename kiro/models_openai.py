@@ -45,6 +45,15 @@ class OpenAIModel(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "anthropic"
     description: Optional[str] = None
+    # Extra metadata sourced from the Kiro ListAvailableModels response. These are
+    # non-standard OpenAI fields (ignored by generic clients) that let richer
+    # consumers (e.g. the opencode kiro-models plugin) pick up real limits and
+    # capabilities instead of hardcoding them.
+    display_name: Optional[str] = None
+    max_input_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = None
+    input_modalities: Optional[List[str]] = None
+    supports_reasoning: Optional[bool] = None
 
 
 class ModelList(BaseModel):
@@ -165,8 +174,8 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = None
     
     # Reasoning (OpenAI reasoning models)
-    # Supports all official reasoning_effort levels from OpenAI API
-    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = None
+    # OpenAI reasoning_effort levels plus Kiro's extended "max" tier.
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]] = None
     
     # Tools (function calling)
     tools: Optional[List[Tool]] = None

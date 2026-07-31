@@ -324,8 +324,9 @@ def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
         "medium": 0.50,   # 50% - balanced reasoning
         "high": 0.80,     # 80% - deep reasoning
         "xhigh": 0.95,    # 95% - maximum reasoning depth
+        "max": 0.98,      # 98% - Kiro extended maximum tier
     }
-    return int(max_tokens * percent[effort])
+    return int(max_tokens * percent.get(effort, 0.80))
 
 
 def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> ThinkingConfig:
@@ -377,13 +378,20 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
         max_tokens = 4096  # Standard output limit
     
     budget = reasoning_effort_to_budget(max_tokens, request.reasoning_effort)
-    
+
+    # Pass the effort through natively when it maps to a Kiro effort level.
+    # OpenAI "minimal" maps to Kiro "low"; low/medium/high pass through; the
+    # Kiro-only "xhigh"/"max" are also accepted if a client sends them.
+    effort_map = {"minimal": "low", "low": "low", "medium": "medium", "high": "high",
+                  "xhigh": "xhigh", "max": "max"}
+    effort = effort_map.get(request.reasoning_effort)
+
     logger.debug(
         f"Extracted thinking config from OpenAI: reasoning_effort='{request.reasoning_effort}', "
-        f"max_tokens={max_tokens}, budget={budget}"
+        f"max_tokens={max_tokens}, budget={budget}, effort={effort}"
     )
-    
-    return ThinkingConfig(enabled=True, budget_tokens=budget)
+
+    return ThinkingConfig(enabled=True, budget_tokens=budget, effort=effort)
 
 
 # ==================================================================================================
@@ -393,7 +401,8 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
 def build_kiro_payload(
     request_data: ChatCompletionRequest,
     conversation_id: str,
-    profile_arn: str
+    profile_arn: str,
+    model_metadata: Optional[dict] = None
 ) -> dict:
     """
     Builds complete payload for Kiro API from OpenAI request.
@@ -440,7 +449,8 @@ def build_kiro_payload(
         tools=unified_tools,
         conversation_id=conversation_id,
         profile_arn=profile_arn,
-        thinking_config=thinking_config
+        thinking_config=thinking_config,
+        model_metadata=model_metadata
     )
     
     return result.payload

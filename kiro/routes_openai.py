@@ -48,6 +48,7 @@ from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
+from kiro.converters_core import lookup_model_metadata as _lookup_model_metadata
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
@@ -119,6 +120,31 @@ async def health():
         "version": APP_VERSION
     }
 
+
+@router.get("/connection")
+async def connection(request: Request):
+    """
+    Return connection info for local consumers (e.g. the OpenCode
+    kiro-gateway-bridge plugin), so they don't hardcode the key/URL.
+
+    Intentionally UNAUTHENTICATED: this is the bootstrap endpoint that hands out
+    the api key, so it cannot itself require that key. Security relies on the
+    gateway binding to loopback (SERVER_HOST=127.0.0.1) — bind to a public
+    interface at your own risk, since this exposes PROXY_API_KEY to anyone who
+    can reach the port.
+
+    base_url/mcp_url are derived from the host:port the client used to reach the
+    gateway, so a caller on 127.0.0.1:<port> gets URLs pointing back at itself.
+    """
+    host = request.url.hostname or "127.0.0.1"
+    port = request.url.port
+    authority = f"{host}:{port}" if port else host
+    return {
+        "base_url": f"http://{authority}/v1",
+        "api_key": PROXY_API_KEY,
+        "mcp_url": f"http://{authority}/mcp-tools/mcp",
+    }
+
 @router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_api_key)])
 async def get_models(request: Request):
     """
@@ -144,16 +170,30 @@ async def get_models(request: Request):
         account = request.app.state.account_manager.get_first_account()
         available_model_ids = account.model_resolver.get_available_models()
     
-    # Build OpenAI-compatible model list
-    openai_models = [
-        OpenAIModel(
-            id=model_id,
-            owned_by="anthropic",
-            description="Claude model via Kiro API"
+    # Build OpenAI-compatible model list, enriching with cached Kiro metadata
+    # (token limits, display name, input modalities) when available.
+    account_manager = request.app.state.account_manager
+    openai_models = []
+    for model_id in available_model_ids:
+        meta = account_manager.get_model_metadata(model_id) or {}
+        token_limits = meta.get("tokenLimits") or {}
+        # A model advertises extended thinking iff its request-fields schema
+        # exposes a "thinking" property. Absent schema => no reasoning support.
+        schema = meta.get("additionalModelRequestFieldsSchema") or {}
+        schema_props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        openai_models.append(
+            OpenAIModel(
+                id=model_id,
+                owned_by="anthropic",
+                description="Claude model via Kiro API",
+                display_name=meta.get("modelName") or meta.get("displayName"),
+                max_input_tokens=token_limits.get("maxInputTokens"),
+                max_output_tokens=token_limits.get("maxOutputTokens"),
+                input_modalities=meta.get("supportedInputTypes"),
+                supports_reasoning="thinking" in schema_props,
+            )
         )
-        for model_id in available_model_ids
-    ]
-    
+
     return ModelList(data=openai_models)
 
 
@@ -330,7 +370,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 kiro_payload = build_kiro_payload(
                     request_data,
                     conversation_id,
-                    profile_arn_for_payload
+                    profile_arn_for_payload,
+                    model_metadata=_lookup_model_metadata(model_cache, model_resolver, request_data.model)
                 )
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
@@ -578,7 +619,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         kiro_payload = build_kiro_payload(
             request_data,
             conversation_id,
-            profile_arn_for_payload
+            profile_arn_for_payload,
+            model_metadata=_lookup_model_metadata(model_cache, model_resolver, request_data.model)
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

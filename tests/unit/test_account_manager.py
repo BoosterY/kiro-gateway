@@ -756,14 +756,8 @@ class TestAccountManagerInitializeAccount:
         account_id = str(test_json.resolve())
         
         # Mock HTTP client for ListAvailableModels
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
-            mock_client = AsyncMock()
-            mock_response = Mock()  # Response is not async
-            mock_response.status_code = 200
-            mock_response.json.return_value = mock_list_models_response
-            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
-            mock_client.close = AsyncMock()
-            mock_http_class.return_value = mock_client
+        with patch('kiro.account_manager.fetch_available_models',
+                   AsyncMock(return_value=mock_list_models_response["models"])):
             
             # Act
             success = await manager._initialize_account(account_id)
@@ -807,11 +801,8 @@ class TestAccountManagerInitializeAccount:
         account_id = str(test_json.resolve())
         
         # Mock HTTP client to fail
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
-            mock_client = AsyncMock()
-            mock_client.request_with_retry = AsyncMock(side_effect=Exception("Network error"))
-            mock_client.close = AsyncMock()
-            mock_http_class.return_value = mock_client
+        with patch('kiro.account_manager.fetch_available_models',
+                   AsyncMock(side_effect=Exception("Network error"))):
             
             # Act
             success = await manager._initialize_account(account_id)
@@ -859,14 +850,8 @@ class TestAccountManagerGetNextAccount:
         account_id = str(test_json.resolve())
         
         # Initialize account
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
-            mock_client = AsyncMock()
-            mock_response = Mock()  # Response is not async
-            mock_response.status_code = 200
-            mock_response.json.return_value = mock_list_models_response
-            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
-            mock_client.close = AsyncMock()
-            mock_http_class.return_value = mock_client
+        with patch('kiro.account_manager.fetch_available_models',
+                   AsyncMock(return_value=mock_list_models_response["models"])):
             
             await manager._initialize_account(account_id)
         
@@ -919,14 +904,8 @@ class TestAccountManagerReportSuccess:
         account_id = str(test_json.resolve())
         
         # Initialize account
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
-            mock_client = AsyncMock()
-            mock_response = Mock()  # Response is not async
-            mock_response.status_code = 200
-            mock_response.json.return_value = mock_list_models_response
-            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
-            mock_client.close = AsyncMock()
-            mock_http_class.return_value = mock_client
+        with patch('kiro.account_manager.fetch_available_models',
+                   AsyncMock(return_value=mock_list_models_response["models"])):
             
             await manager._initialize_account(account_id)
         
@@ -972,14 +951,8 @@ class TestAccountManagerReportSuccess:
         account_id = str(test_json.resolve())
         
         # Initialize account
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
-            mock_client = AsyncMock()
-            mock_response = Mock()  # Response is not async
-            mock_response.status_code = 200
-            mock_response.json.return_value = mock_list_models_response
-            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
-            mock_client.close = AsyncMock()
-            mock_http_class.return_value = mock_client
+        with patch('kiro.account_manager.fetch_available_models',
+                   AsyncMock(return_value=mock_list_models_response["models"])):
             
             await manager._initialize_account(account_id)
         
@@ -1030,14 +1003,8 @@ class TestAccountManagerReportFailure:
         account_id = str(test_json.resolve())
         
         # Initialize account
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
-            mock_client = AsyncMock()
-            mock_response = Mock()  # Response is not async
-            mock_response.status_code = 200
-            mock_response.json.return_value = mock_list_models_response
-            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
-            mock_client.close = AsyncMock()
-            mock_http_class.return_value = mock_client
+        with patch('kiro.account_manager.fetch_available_models',
+                   AsyncMock(return_value=mock_list_models_response["models"])):
             
             await manager._initialize_account(account_id)
         
@@ -1083,14 +1050,8 @@ class TestAccountManagerReportFailure:
         account_id = str(test_json.resolve())
         
         # Initialize account
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
-            mock_client = AsyncMock()
-            mock_response = Mock()  # Response is not async
-            mock_response.status_code = 200
-            mock_response.json.return_value = mock_list_models_response
-            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
-            mock_client.close = AsyncMock()
-            mock_http_class.return_value = mock_client
+        with patch('kiro.account_manager.fetch_available_models',
+                   AsyncMock(return_value=mock_list_models_response["models"])):
             
             await manager._initialize_account(account_id)
         
@@ -1177,14 +1138,8 @@ class TestAccountManagerGetFirstAccount:
         account_id = str(test_json.resolve())
         
         # Initialize account
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
-            mock_client = AsyncMock()
-            mock_response = Mock()  # Response is not async
-            mock_response.status_code = 200
-            mock_response.json.return_value = mock_list_models_response
-            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
-            mock_client.close = AsyncMock()
-            mock_http_class.return_value = mock_client
+        with patch('kiro.account_manager.fetch_available_models',
+                   AsyncMock(return_value=mock_list_models_response["models"])):
             
             await manager._initialize_account(account_id)
         
@@ -1253,14 +1208,8 @@ class TestAccountManagerGetAllAvailableModels:
         account_id = str(test_json.resolve())
         
         # Initialize account
-        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
-            mock_client = AsyncMock()
-            mock_response = Mock()  # Response is not async
-            mock_response.status_code = 200
-            mock_response.json.return_value = mock_list_models_response
-            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
-            mock_client.close = AsyncMock()
-            mock_http_class.return_value = mock_client
+        with patch('kiro.account_manager.fetch_available_models',
+                   AsyncMock(return_value=mock_list_models_response["models"])):
             
             await manager._initialize_account(account_id)
         

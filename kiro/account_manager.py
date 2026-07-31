@@ -37,15 +37,16 @@ import hashlib
 import json
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from loguru import logger
 
-from kiro.auth import KiroAuthManager, AuthType
+from kiro.auth import KiroAuthManager
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver, normalize_model_name
 from kiro.config import (
@@ -55,13 +56,11 @@ from kiro.config import (
     ACCOUNT_RECOVERY_TIMEOUT,
     ACCOUNT_MAX_BACKOFF_MULTIPLIER,
     ACCOUNT_PROBABILISTIC_RETRY_CHANCE,
-    ACCOUNT_CACHE_TTL,
     STATE_SAVE_INTERVAL_SECONDS,
     FALLBACK_MODELS,
 )
 from kiro.utils import get_kiro_headers
 from kiro.account_errors import ErrorType
-from kiro.http_client import KiroHttpClient
 
 
 def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
@@ -91,6 +90,48 @@ def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
         False
     """
     return "://runtime." in auth_manager.api_host
+
+
+def _legacy_q_host(auth_manager: KiroAuthManager) -> str:
+    """
+    Return the legacy q.{region}.amazonaws.com host for this account.
+
+    The migrated runtime.{region}.kiro.dev host does not expose the
+    ListAvailableModels operation (returns UnknownOperationException), but the
+    legacy q.{region}.amazonaws.com host still serves it. This mirrors the MCP
+    web_search host-rewrite in kiro/mcp_tools.py.
+    """
+    m = re.search(r"(?:runtime|q)\.([a-z0-9-]+)\.(?:kiro\.dev|amazonaws\.com)", auth_manager.q_host)
+    return f"https://q.{m.group(1)}.amazonaws.com" if m else auth_manager.q_host
+
+
+async def fetch_available_models(auth_manager: KiroAuthManager) -> List[Dict[str, Any]]:
+    """
+    Fetch the live model list via the CodeWhisperer ListAvailableModels operation.
+
+    Uses AWS JSON 1.0 framing (POST / with x-amz-target) against the legacy
+    q.{region}.amazonaws.com host, which serves this operation even for accounts
+    migrated to the runtime.{region}.kiro.dev data-plane. Requires both origin
+    and profileArn in the body; omitting either yields REQUEST_BODY_INVALID.
+
+    Returns the raw `models` array (each entry carries modelId, modelName,
+    tokenLimits.{maxInputTokens,maxOutputTokens}, supportedInputTypes, ...).
+    Raises on non-200 or transport failure so callers can fall back to cache.
+    """
+    token = await auth_manager.get_access_token()
+    headers = get_kiro_headers(auth_manager, token)
+    headers["x-amz-target"] = "AmazonCodeWhispererService.ListAvailableModels"
+
+    body = {"origin": "AI_EDITOR"}
+    if auth_manager.profile_arn:
+        body["profileArn"] = auth_manager.profile_arn
+
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        response = await client.post(f"{_legacy_q_host(auth_manager)}/", headers=headers, content=json.dumps(body).encode())
+
+    if response.status_code != 200:
+        raise RuntimeError(f"ListAvailableModels returned {response.status_code}: {response.text[:200]}")
+    return response.json().get("models", [])
 
 
 def _format_duration(seconds: float) -> str:
@@ -497,48 +538,16 @@ class AccountManager:
             # Get token to verify credentials
             token = await auth_manager.get_access_token()
             
-            # Determine if we should fetch models or use static list
-            if _is_runtime_endpoint(auth_manager):
-                # New runtime endpoint does not provide /ListAvailableModels (AWS limitation)
-                # Use static list without attempting request
-                logger.debug(f"Account {account_id}: Using static model list for runtime.kiro.dev endpoint")
+            # Fetch the live model list via ListAvailableModels on the legacy
+            # q.{region}.amazonaws.com host (served even for runtime-endpoint
+            # accounts). Falls back to the static list on any failure.
+            try:
+                models_list = await fetch_available_models(auth_manager)
+                logger.info(f"Account {account_id}: fetched {len(models_list)} models via ListAvailableModels")
+            except Exception as e:
+                logger.warning(f"Failed to fetch models for {account_id}: {e}")
+                logger.warning("Using pre-configured fallback models. Models will be refreshed on next TTL cycle.")
                 models_list = FALLBACK_MODELS
-            else:
-                # Old endpoint - attempt to fetch dynamic model list
-                # Fetch models list with retry + fallback
-                params = {"origin": "AI_EDITOR"}
-                if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
-                    params["profileArn"] = auth_manager.profile_arn
-                
-                list_models_url = f"{auth_manager.q_host}/ListAvailableModels"
-                
-                # Use KiroHttpClient for retry logic (3 attempts with exponential backoff)
-                http_client = KiroHttpClient(auth_manager, shared_client=None)
-                
-                try:
-                    response = await http_client.request_with_retry(
-                        method="GET",
-                        url=list_models_url,
-                        json_data=None,
-                        params=params,
-                        stream=False
-                    )
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        models_list = data.get("models", [])
-                    else:
-                        # Shouldn't happen (retry handles non-200), but keep for safety
-                        raise Exception(f"HTTP {response.status_code}")
-                
-                except Exception as e:
-                    # All retries exhausted - use fallback
-                    logger.error(f"Failed to fetch models for {account_id} after retries: {e}")
-                    logger.warning("Using pre-configured fallback models. Models will be refreshed on next TTL cycle when network recovers.")
-                    models_list = FALLBACK_MODELS
-                
-                finally:
-                    await http_client.close()
             
             # Create model cache and update
             model_cache = ModelInfoCache()
@@ -589,58 +598,26 @@ class AccountManager:
         if not account or not account.auth_manager:
             return
         
-        # Check if using runtime endpoint (no dynamic model list available)
-        if _is_runtime_endpoint(account.auth_manager):
-            # Runtime endpoint does not provide /ListAvailableModels
-            # Use static list and update cache timestamp
-            logger.debug(f"Account {account_id}: Skipping model refresh for runtime.kiro.dev endpoint (using static list)")
-            await account.model_cache.update(FALLBACK_MODELS)
-            account.models_cached_at = time.time()
-            self._dirty = True
-            return
-        
-        # Old endpoint - attempt to fetch dynamic model list
-        # Use KiroHttpClient for retry logic
-        http_client = KiroHttpClient(account.auth_manager, shared_client=None)
-        
+        # Fetch the live model list; keep the existing cache on any failure.
         try:
-            params = {"origin": "AI_EDITOR"}
-            if account.auth_manager.auth_type == AuthType.KIRO_DESKTOP and account.auth_manager.profile_arn:
-                params["profileArn"] = account.auth_manager.profile_arn
-            
-            list_models_url = f"{account.auth_manager.q_host}/ListAvailableModels"
-            
-            response = await http_client.request_with_retry(
-                method="GET",
-                url=list_models_url,
-                json_data=None,
-                params=params,
-                stream=False
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                models_list = data.get("models", [])
-                await account.model_cache.update(models_list)
-                account.models_cached_at = time.time()
-                
-                # Update model_to_accounts mapping (new models may have appeared)
-                available_models = account.model_resolver.get_available_models()
-                for model in available_models:
-                    if model not in self._model_to_accounts:
-                        self._model_to_accounts[model] = ModelAccountList()
-                    if account_id not in self._model_to_accounts[model].accounts:
-                        self._model_to_accounts[model].accounts.append(account_id)
-                
-                logger.debug(f"Refreshed models for {account_id}")
-                self._dirty = True
-        
+            models_list = await fetch_available_models(account.auth_manager)
+            await account.model_cache.update(models_list)
+            account.models_cached_at = time.time()
+
+            # Update model_to_accounts mapping (new models may have appeared)
+            available_models = account.model_resolver.get_available_models()
+            for model in available_models:
+                if model not in self._model_to_accounts:
+                    self._model_to_accounts[model] = ModelAccountList()
+                if account_id not in self._model_to_accounts[model].accounts:
+                    self._model_to_accounts[model].accounts.append(account_id)
+
+            logger.debug(f"Refreshed {len(models_list)} models for {account_id}")
+            self._dirty = True
+
         except Exception as e:
-            # All retries exhausted - keep using stale cache
-            logger.warning(f"Failed to refresh models for {account_id} after retries: {e}")
-        
-        finally:
-            await http_client.close()
+            # Keep using stale cache on failure
+            logger.warning(f"Failed to refresh models for {account_id}: {e}")
     
     async def get_next_account(self, model: str, exclude_accounts: Optional[set] = None) -> Optional[Account]:
         """
@@ -678,14 +655,8 @@ class AccountManager:
                     if not success:
                         return None
                 
-                # Check TTL and refresh if needed
-                if account.models_cached_at > 0:
-                    age = time.time() - account.models_cached_at
-                    if age > ACCOUNT_CACHE_TTL:
-                        try:
-                            await self._refresh_account_models(account_id)
-                        except Exception as e:
-                            logger.warning(f"Failed to refresh models for {account_id}: {e}")
+                # Model list is fetched once at account initialization (startup).
+                # It changes rarely, so we do not re-check per request; restart to refresh.
                 # # Validate model availability
                 # if account.model_resolver:
                 #     normalized_model = normalize_model_name(model)
@@ -742,14 +713,8 @@ class AccountManager:
                         self._dirty = True
                         continue
                 
-                # Check TTL and refresh if needed
-                if account.models_cached_at > 0:
-                    age = time.time() - account.models_cached_at
-                    if age > ACCOUNT_CACHE_TTL:
-                        try:
-                            await self._refresh_account_models(account_id)
-                        except Exception as e:
-                            logger.warning(f"Failed to refresh models for {account_id}: {e}")
+                # Model list is fetched once at account initialization (startup);
+                # no per-request refresh. Restart to pick up newly released models.
                 # # Check if model is available on this account
                 # available_models = account.model_resolver.get_available_models()
                 # if normalized_model not in available_models:
@@ -895,3 +860,27 @@ class AccountManager:
             if account.model_resolver:
                 all_models.update(account.model_resolver.get_available_models())
         return sorted(all_models)
+
+    def get_model_metadata(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Return the cached raw Kiro model entry for a model id, if known.
+
+        The entry carries the fields returned by ListAvailableModels
+        (modelId, modelName, tokenLimits, supportedInputTypes, ...). Returns
+        None for ids only known via aliases/hidden mappings without a cache row.
+        """
+        for account in self._accounts.values():
+            if not account.model_cache:
+                continue
+            entry = account.model_cache.get(model_id)
+            if entry:
+                return entry
+            # Resolve aliases (e.g. auto-kiro -> auto) so aliased ids inherit
+            # the underlying model's cached limits/metadata.
+            if account.model_resolver:
+                resolved = account.model_resolver.resolve(model_id)
+                if resolved and resolved.internal_id != model_id:
+                    entry = account.model_cache.get(resolved.internal_id)
+                    if entry:
+                        return entry
+        return None

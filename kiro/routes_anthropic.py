@@ -45,6 +45,7 @@ from kiro.models_anthropic import (
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.converters_anthropic import anthropic_to_kiro
+from kiro.converters_core import lookup_model_metadata as _lookup_model_metadata
 from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
@@ -383,7 +384,8 @@ async def messages(
                 kiro_payload = anthropic_to_kiro(
                     request_data,
                     conversation_id,
-                    profile_arn_for_payload
+                    profile_arn_for_payload,
+                    model_metadata=_lookup_model_metadata(model_cache, model_resolver, request_data.model)
                 )
             except ValueError as e:
                 logger.error(f"Conversion error: {e}")
@@ -691,7 +693,8 @@ async def messages(
         kiro_payload = anthropic_to_kiro(
             request_data,
             conversation_id,
-            profile_arn_for_payload
+            profile_arn_for_payload,
+            model_metadata=_lookup_model_metadata(model_cache, model_resolver, request_data.model)
         )
     except ValueError as e:
         logger.error(f"Conversion error: {e}")

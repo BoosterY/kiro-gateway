@@ -401,33 +401,35 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=True, budget_tokens=8000)
     """
-    if not request.thinking:
-        # No thinking specified → use defaults
-        return ThinkingConfig(enabled=True, budget_tokens=None)
+    # output_config.effort may arrive with or without a thinking block.
+    _output_config = getattr(request, "output_config", None)
+    _effort = _output_config.get("effort") if isinstance(_output_config, dict) else None
+
+    if not request.thinking or not isinstance(request.thinking, dict):
+        # No/invalid thinking block → defaults, but still honor a bare effort
+        return ThinkingConfig(enabled=True, budget_tokens=None, effort=_effort)
     
-    if not isinstance(request.thinking, dict):
-        # Invalid format → use defaults
-        return ThinkingConfig(enabled=True, budget_tokens=None)
-    
+    # Kiro-native effort is carried in the sibling output_config.effort field
+    # (sent by @ai-sdk/anthropic for adaptive-thinking models like Opus 4.7+).
     thinking_type = request.thinking.get("type")
-    
+
     if thinking_type == "disabled":
         # Explicitly disabled
-        return ThinkingConfig(enabled=False, budget_tokens=None)
-    
-    if thinking_type == "enabled":
-        # Extract budget_tokens
-        budget = request.thinking.get("budget_tokens")
-        if budget:
-            logger.debug(f"Extracted thinking config from Anthropic: type='enabled', budget={budget}")
-        return ThinkingConfig(enabled=True, budget_tokens=budget)
-    
-    # Unknown type → use defaults
-    return ThinkingConfig(enabled=True, budget_tokens=None)
+        return ThinkingConfig(enabled=False, budget_tokens=None, effort=_effort)
+
+    if thinking_type in ("enabled", "adaptive"):
+        # "enabled" carries a token budget; "adaptive" carries effort via output_config
+        budget = request.thinking.get("budget_tokens") if thinking_type == "enabled" else None
+        logger.debug(f"Extracted thinking config from Anthropic: type='{thinking_type}', budget={budget}, effort={_effort}")
+        return ThinkingConfig(enabled=True, budget_tokens=budget, effort=_effort)
+
+    # Unknown type → use defaults (carry effort through if present)
+    return ThinkingConfig(enabled=True, budget_tokens=None, effort=_effort)
 
 
 def anthropic_to_kiro(
-    request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str
+    request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str,
+    model_metadata: Optional[dict] = None
 ) -> dict:
     """
     Converts Anthropic Messages API request to Kiro API payload.
@@ -483,6 +485,7 @@ def anthropic_to_kiro(
         conversation_id=conversation_id,
         profile_arn=profile_arn,
         thinking_config=thinking_config,
+        model_metadata=model_metadata,
     )
 
     return result.payload

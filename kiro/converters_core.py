@@ -78,6 +78,75 @@ class ThinkingConfig:
     """
     enabled: bool = True
     budget_tokens: Optional[int] = None
+    # Kiro-native reasoning effort: one of low|medium|high|xhigh|max, or None to
+    # let Kiro use its per-model default (high). Only applied to models that
+    # advertise the thinking schema via additionalModelRequestFieldsSchema.
+    effort: Optional[str] = None
+
+
+VALID_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def build_additional_model_request_fields(thinking_config: "ThinkingConfig") -> Optional[dict]:
+    """
+    Build Kiro's native additionalModelRequestFields from a ThinkingConfig.
+
+    Returns None when there is nothing model-specific to send (thinking enabled
+    with no explicit effort), so callers can omit the field entirely. When
+    thinking is disabled or an effort is set, returns the corresponding native
+    payload: {"thinking": {...}} and/or {"output_config": {"effort": ...}}.
+
+    IMPORTANT: callers must only attach the result to requests for models that
+    support it (see model_supports_reasoning_fields); Kiro returns 400
+    "additionalModelRequestFields is not supported for this model" otherwise.
+    """
+    fields: dict = {}
+
+    if not thinking_config.enabled:
+        fields["thinking"] = {"type": "disabled"}
+        return fields
+
+    if thinking_config.effort and thinking_config.effort in VALID_EFFORT_LEVELS:
+        fields["output_config"] = {"effort": thinking_config.effort}
+
+    return fields or None
+
+
+def lookup_model_metadata(model_cache, model_resolver, model_name: str) -> Optional[dict]:
+    """
+    Resolve a client-supplied model name to its cached ListAvailableModels entry.
+
+    Tries the cache directly, then via the resolver's alias/normalization
+    (e.g. auto-kiro -> auto). Returns None when nothing is cached.
+    """
+    if not model_cache:
+        return None
+    entry = model_cache.get(model_name)
+    if entry:
+        return entry
+    if model_resolver:
+        try:
+            resolved = model_resolver.resolve(model_name)
+        except Exception:
+            return None
+        if resolved and resolved.internal_id != model_name:
+            return model_cache.get(resolved.internal_id)
+    return None
+
+
+def model_supports_reasoning_fields(model_metadata: Optional[dict]) -> bool:
+    """
+    Whether a model advertises the native thinking request-fields schema.
+
+    Kiro only accepts additionalModelRequestFields for models whose
+    ListAvailableModels entry includes additionalModelRequestFieldsSchema with a
+    `thinking` property (e.g. Opus 4.6+/Sonnet 4.6+/Opus 5/Sonnet 5).
+    """
+    if not model_metadata:
+        return False
+    schema = model_metadata.get("additionalModelRequestFieldsSchema") or {}
+    props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    return "thinking" in props
 
 
 @dataclass
@@ -1409,7 +1478,8 @@ def build_kiro_payload(
     tools: Optional[List[UnifiedTool]],
     conversation_id: str,
     profile_arn: str,
-    thinking_config: ThinkingConfig
+    thinking_config: ThinkingConfig,
+    model_metadata: Optional[dict] = None
 ) -> KiroPayloadResult:
     """
     Builds complete payload for Kiro API from unified data.
@@ -1583,6 +1653,14 @@ def build_kiro_payload(
     # Add profileArn
     if profile_arn:
         payload["profileArn"] = profile_arn
+
+    # Attach Kiro-native additionalModelRequestFields (thinking type/effort), but
+    # only for models that advertise support — Kiro 400s otherwise.
+    if model_supports_reasoning_fields(model_metadata):
+        amrf = build_additional_model_request_fields(thinking_config)
+        if amrf:
+            payload["additionalModelRequestFields"] = amrf
+            logger.debug(f"Attached additionalModelRequestFields: {amrf}")
 
     # Payload size guard — auto-trim if enabled
     if AUTO_TRIM_PAYLOAD:
