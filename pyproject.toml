@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kiro-gateway"
+version = "0.1.0"
+description = "Kiro Gateway — local OpenAI/Anthropic-compatible proxy for Kiro (BoosterY fork)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "loguru",
+    "python-dotenv",
+    "tiktoken",
+    "mcp>=2.0.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio", "hypothesis"]
+
+[project.scripts]
+kiro-gateway = "main:main"
+
+# The app is a top-level module (main.py) plus the kiro/ package; ship both.
+# Explicitly listed because the project root is not a conventional src/ layout,
+# so autodiscovery would otherwise miss main.py or pick up tests/.
+[tool.hatch.build.targets.wheel]
+include = ["main.py", "kiro/**/*.py"]
+
+[tool.hatch.build.targets.wheel.sources]
+"main.py" = "main.py"

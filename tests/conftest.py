@@ -11,6 +11,7 @@ import asyncio
 import json
 import pytest
 import time
+from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, Any, List
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from datetime import datetime, timezone
@@ -393,6 +394,35 @@ def mock_httpx_response():
 # =============================================================================
 # Global Network Blocking
 # =============================================================================
+
+@pytest.fixture(autouse=True)
+def reset_mcp_session_manager():
+    """
+    Make MCP session manager reentrant for tests.
+
+    In mcp 2.x, StreamableHTTPSessionManager.run() can only be called once per
+    instance. Since the MCPServer is a module-level singleton, tests that trigger
+    the app lifespan (which calls session_manager.run()) would fail on repeated
+    invocations. We patch run() to be a no-op async context manager so that
+    lifespan tests work correctly even when called multiple times within a single
+    test.
+    """
+    try:
+        from kiro import mcp_server as _mcp_mod
+        sm = _mcp_mod.mcp.session_manager
+
+        @asynccontextmanager
+        async def _mock_run():
+            yield
+
+        original_run = sm.run
+        sm.run = _mock_run
+        yield
+        sm.run = original_run
+    except (RuntimeError, AttributeError):
+        # session_manager not yet created (streamable_http_app not called)
+        yield
+
 
 @pytest.fixture(scope="session", autouse=True)
 def block_all_network_calls():

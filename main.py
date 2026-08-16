@@ -48,6 +48,18 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+# Anchor the working directory to the project root BEFORE importing kiro.config,
+# whose module-level load_dotenv() reads .env relative to cwd — and before the
+# account manager reads the cwd-relative credentials.json. This lets the
+# installed `kiro-gateway` command run from any directory: an editable install
+# keeps __file__ pointing at this source tree (where .env/credentials.json live),
+# and KIRO_GATEWAY_HOME can override it explicitly if ever needed.
+_project_root = os.environ.get("KIRO_GATEWAY_HOME") or str(Path(__file__).resolve().parent)
+try:
+    os.chdir(_project_root)
+except OSError as _e:
+    logging.getLogger(__name__).warning("kiro-gateway: could not chdir to %s: %s", _project_root, _e)
+
 import httpx
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -586,11 +598,14 @@ app.include_router(anthropic_router)
 
 
 # --- Native MCP endpoint (client-driven web_search) ---
-# Mounts the FastMCP StreamableHTTP sub-app. Full endpoint URL is:
+# Mounts the MCPServer StreamableHTTP sub-app. Full endpoint URL is:
 #   http://<host>:<port>/mcp-tools/mcp
+# stateless_http=True so each request is self-contained (no server-side session
+# state to track) — simplest to reason about behind the gateway and matches how
+# opencode connects (initialize/tools-list/tools-call per turn).
 # Calling streamable_http_app() here also lazily creates the session manager
 # that the lifespan starts via mcp_server.mcp.session_manager.run().
-app.mount("/mcp-tools", mcp_server.mcp.streamable_http_app())
+app.mount("/mcp-tools", mcp_server.mcp.streamable_http_app(stateless_http=True))
 
 
 # --- Uvicorn log config ---
@@ -749,30 +764,38 @@ def print_startup_banner(host: str, port: int) -> None:
 
 
 # --- Entry Point ---
-if __name__ == "__main__":
+def main():
+    """Console-script entry point (pyproject `kiro-gateway`) and `python main.py`.
+
+    Kept as a function so packaging can expose it on PATH; the uvicorn target is
+    passed as the imported `app` object rather than the "main:app" string, since
+    the installed console script does not run as a module named `main`."""
     import uvicorn
-    
+
     # Parse CLI arguments first (handles --version, --help without requiring config)
     args = parse_cli_args()
-    
+
     # Run configuration validation before starting server
     validate_configuration()
-    
+
     # Warn about suboptimal timeout configuration
     _warn_timeout_configuration()
-    
+
     # Resolve final configuration with priority hierarchy
     final_host, final_port = resolve_server_config(args)
-    
+
     # Print startup banner
     print_startup_banner(final_host, final_port)
-    
+
     logger.info(f"Starting Uvicorn server on {final_host}:{final_port}...")
-    
-    # Use string reference to avoid double module import
+
     uvicorn.run(
-        "main:app",
+        app,
         host=final_host,
         port=final_port,
         log_config=UVICORN_LOG_CONFIG,
     )
+
+
+if __name__ == "__main__":
+    main()

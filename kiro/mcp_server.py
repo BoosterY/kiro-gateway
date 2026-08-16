@@ -19,7 +19,7 @@ holder (same process), set during the app lifespan.
 """
 
 from loguru import logger
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from kiro.mcp_tools import call_kiro_mcp_api, generate_search_summary
 
@@ -41,13 +41,14 @@ def set_account_manager(account_manager) -> None:
 
 
 # ---------------------------------------------------------------------------
-# FastMCP instance
+# MCPServer instance
 #
-# stateless_http=True so each request is self-contained (no server-side session
-# state to track) — simplest to reason about behind the gateway and matches how
-# opencode connects (initialize/tools-list/tools-call per turn).
+# In mcp 2.x, stateless_http is passed to streamable_http_app() rather than
+# the constructor. See main.py where .streamable_http_app(stateless_http=True)
+# is called at mount time so each request is self-contained (no server-side
+# session state to track).
 # ---------------------------------------------------------------------------
-mcp = FastMCP("kiro-tools", stateless_http=True)
+mcp = MCPServer("kiro-tools")
 
 
 @mcp.tool(
